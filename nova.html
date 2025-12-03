@@ -730,9 +730,6 @@
           console.warn("Could not restart recognition:", e);
         }
       };
-
-      // IMPORTANT: some browsers only allow start after user interaction.
-      // So we call this from a user action instead of automatically.
     }
 
     // ------------------------------
@@ -823,10 +820,11 @@
       setSpeechBadge();
       updateModeUI();
 
-      // Warn if not secure context (file:// or plain http without localhost)
-      if (!window.isSecureContext && location.hostname !== "localhost") {
+      // ✅ CORRECTED SECURITY CHECK
+      const isLocalhost = ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
+      if (!window.isSecureContext && !isLocalhost) {
         setLog(
-          "This page is not in a secure context. Please run from <strong>http://localhost</strong> or <strong>HTTPS</strong> (GitHub Pages). Camera and microphone may not work here."
+          "This page is not in a secure context. Please use <strong>HTTPS</strong> (like GitHub Pages) or run on <strong>http://localhost</strong>. Camera and microphone may not work here."
         );
       }
 
