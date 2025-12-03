@@ -343,6 +343,50 @@
 
   <script>
     // ------------------------------
+    // OLLAMA CONFIG (LLM ASSISTANT)
+    // ------------------------------
+    const USE_OLLAMA = true; // set to false if you don't want LLM
+
+    // If app + Ollama are on same computer:
+    let OLLAMA_URL = "http://localhost:11434/api/generate";
+
+    // Example model: "llama3.2" (change to your installed model)
+    const OLLAMA_MODEL = "llama3.2";
+
+    // If you open this page on a phone and Ollama runs on a PC,
+    // change OLLAMA_URL to something like:
+    // OLLAMA_URL = "http://192.168.0.10:11434/api/generate";
+
+    async function callOllama(systemPrompt, userPrompt) {
+      if (!USE_OLLAMA) return null;
+
+      const fullPrompt = `${systemPrompt}\n\nUser:\n${userPrompt}\nAssistant:`;
+      try {
+        const res = await fetch(OLLAMA_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: OLLAMA_MODEL,
+            prompt: fullPrompt,
+            stream: false
+          })
+        });
+
+        if (!res.ok) {
+          console.warn("Ollama HTTP error:", res.status);
+          return null;
+        }
+
+        const data = await res.json();
+        const text = (data.response || "").trim();
+        return text || null;
+      } catch (err) {
+        console.warn("Ollama request failed:", err);
+        return null;
+      }
+    }
+
+    // ------------------------------
     // GLOBAL STATE
     // ------------------------------
     let video = null;
@@ -369,7 +413,7 @@
     const SPEAK_INTERVAL_MS = 3000;
 
     // For book reading
-    const CROP_SCALE = 0.9;  // use most of the frame, not tiny box
+    const CROP_SCALE = 0.9;  // use most of the frame
     const MAX_OCR_ATTEMPTS = 3;
     const BASE_UPSCALE = 2.0;
 
@@ -380,6 +424,10 @@
     let isBookScanBusy = false;
     let noTextSeenCount = 0;
     const AUTO_SCAN_INTERVAL_MS = 6000;
+
+    // Ollama scene description state
+    let ollamaSceneBusy = false;
+    let lastOllamaSceneText = "";
 
     // ------------------------------
     // HELPERS: UI + SPEECH
@@ -662,6 +710,62 @@
       distanceStatus.textContent = `Nearest: ${best.class} ~${meters.toFixed(1)}m`;
     }
 
+    // ---------- Ollama: smart navigation sentence ----------
+    async function smartDescribeSceneWithOllama(predictions) {
+      if (!USE_OLLAMA) return;
+      if (ollamaSceneBusy) return;
+      if (!predictions || !predictions.length) return;
+      if (!canvas) return;
+
+      ollamaSceneBusy = true;
+
+      try {
+        const width = canvas.width || 1;
+        const lines = predictions.map((p) => {
+          const [x, y, w, h] = p.bbox;
+          const centerX = x + w / 2;
+          let where = "center";
+          if (centerX < width * 0.33) where = "left";
+          else if (centerX > width * 0.66) where = "right";
+
+          const { meters } = estimateDistanceMeters(p.bbox);
+          return `${p.class} at about ${meters.toFixed(1)} meters, ${where} side`;
+        });
+
+        const sceneText = lines.join("; ");
+
+        if (sceneText === lastOllamaSceneText) {
+          ollamaSceneBusy = false;
+          return;
+        }
+
+        lastOllamaSceneText = sceneText;
+
+        const systemPrompt = `
+You are a very short, calm navigation assistant for a blind person.
+You get a list of obstacles with distance and side (left/center/right).
+Reply with ONE sentence in very simple English.
+Mention the safest direction if possible (for example "keep slightly right", "walk straight").
+Maximum 20 words.
+Do NOT mention lists or meters explicitly, just talk naturally.`;
+
+        const userPrompt = `Detected objects: ${sceneText}`;
+
+        const guidance = await callOllama(systemPrompt, userPrompt);
+        if (guidance) {
+          speak(guidance);
+          const distanceStatus = document.getElementById("distance-status");
+          if (distanceStatus) {
+            distanceStatus.textContent = guidance;
+          }
+        }
+      } finally {
+        setTimeout(() => {
+          ollamaSceneBusy = false;
+        }, 2000);
+      }
+    }
+
     async function detectLoop() {
       if (!isDetecting || !objectModel || !isCameraOn) return;
 
@@ -674,6 +778,8 @@
 
           if (filtered.length) {
             maybeSpeakForPredictions(filtered);
+            // NEW: smarter, LLM-based navigation summary
+            smartDescribeSceneWithOllama(filtered);
           } else {
             document.getElementById("distance-status").textContent = "No obstacle detected.";
           }
@@ -810,9 +916,27 @@
         const goodConfidence = confidence >= 60;
 
         if (goodLength && goodConfidence) {
-          setLog(`<strong>Reading:</strong> ${cleaned}`);
+          let finalText = cleaned;
+
+          // NEW: clean & simplify with Ollama
+          const systemPrompt = `
+You correct and simplify text for a blind person.
+The input is OCR text and may contain mistakes or broken lines.
+1. Fix obvious OCR mistakes.
+2. Merge lines into smooth sentences.
+3. Use very simple English.
+4. Keep important meaning; you can shorten a little if needed.
+Output only the improved text, nothing else.`;
+
+          const userPrompt = cleaned;
+          const improved = await callOllama(systemPrompt, userPrompt);
+          if (improved) {
+            finalText = improved.trim();
+          }
+
+          setLog(`<strong>Reading:</strong> ${finalText}`);
           speak("Reading text.");
-          speak(cleaned);
+          speak(finalText);
         } else {
           if (attempt < MAX_OCR_ATTEMPTS) {
             if (attempt === 1 && hasZoomSupport()) {
@@ -877,7 +1001,24 @@
         const goodConfidence = confidence >= 55;
 
         if (enoughText && goodConfidence) {
-          const snippet = cleaned.slice(0, 150);
+          let finalText = cleaned;
+
+          const systemPrompt = `
+You are reading a page out loud for a mathemat blind person.
+Input is raw OCR of a book page.
+1. Fix OCR mistakes.
+2. Combine lines into smooth sentences/paragraphs.
+3. Use simple, clear English.
+4. Keep all important information, but you may slightly shorten very long text.
+Output only the improved text.`;
+
+          const userPrompt = cleaned;
+          const improved = await callOllama(systemPrompt, userPrompt);
+          if (improved) {
+            finalText = improved.trim();
+          }
+
+          const snippet = finalText.slice(0, 150);
           const lastSnippet = lastAutoReadText;
 
           const similar =
@@ -888,9 +1029,9 @@
           if (!similar) {
             lastAutoReadText = snippet;
             noTextSeenCount = 0;
-            setLog(`<strong>Auto reading:</strong> ${cleaned}`);
+            setLog(`<strong>Auto reading:</strong> ${finalText}`);
             speak("Reading text.");
-            speak(cleaned);
+            speak(finalText);
           }
         } else {
           noTextSeenCount++;
